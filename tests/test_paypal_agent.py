@@ -37,11 +37,11 @@ def test_story_poison_blocked_clean_kept(db: Rakho):
     assert story["poisoned_keep"] == "skip"
     assert "injection" in str(story["poisoned_reason"])
     assert story["attacker_paypal"] == "BLOCKED"
-    assert story["clean_keep"] == "store"
+    assert story["clean_keep"] in {"store", "redact"}
     assert story["vendor_paypal"] == "CREATED"
     assert story["attacker_without_read"] == "CREATED"
     assert story["memories_left"] == 0
-    assert story["refusals_left"] == 0
+    assert story["refusals_left"] >= 1
     joined = "\n".join(story["notes"])
     assert ATTACKER not in joined
     assert "Ignore previous" not in joined

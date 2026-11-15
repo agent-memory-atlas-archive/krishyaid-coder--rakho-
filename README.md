@@ -54,8 +54,8 @@ db.keep("order is late", actor_id="krishy")
 db.keep("password is hunter2", actor_id="krishy")   # refused
 
 db.recall("order", actor_id="krishy")               # late order, no password
-db.forget(actor_id="krishy")                        # gone
-db.audit(actor_id="krishy")                         # empty, and you can prove it
+db.forget(actor_id="krishy")                        # notes gone
+db.audit(actor_id="krishy")                         # refusals + forget event remain; recall is empty
 ```
 
 Every write needs `actor_id`. That is how Krishy's notebook never leaks into Priya's.
@@ -302,7 +302,7 @@ Tools: `keep` / `rakho`, `recall` / `nikaalo`, `forget` / `bhoolo`, `audit` / `d
 - Default gate is **on** (secrets, obvious PII, injection-shaped content). Gate first, embed after.
 - Hindi / German secret phrases, Steuer-ID, and injection-shaped lines are caught in that default gate.
 - Episodes only: raw notes, one owner each. No summaries.
-- Forget is a real delete. Audit shows stored **and** refused (refusals never contain the secret).
+- Forget is a real delete of notes (row + FTS + vector). Audit shows stored, refused, and an append-only mutation log. Refusals and forget events survive `bhoolo` so you can prove it; they never contain the secret.
 - Sluice is opt-in: `gate="sluice"` / `--gate sluice` / `examples/paypal/agent.py --sluice`.
 - Zero required runtime dependencies. SQLite on disk.
 

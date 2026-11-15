@@ -13,6 +13,7 @@ from typing import Any
 
 
 class Embedder(ABC):
+    name: str = "hash"
     dim: int | None = None
 
     @abstractmethod
@@ -47,6 +48,8 @@ def l2_normalize(vec: list[float]) -> list[float]:
 
 class HashingEmbedder(Embedder):
     """Offline fallback. No download, no API. Crude, but Hindi/German still hash."""
+
+    name = "hash"
 
     def __init__(self, dim: int = 256, ngram: int = 3) -> None:
         self.dim = dim
@@ -129,6 +132,7 @@ class JinaEmbedder(Embedder):
     Covers English, Hindi, German. Get a key at https://jina.ai/embeddings
     """
 
+    name = "jina"
     DEFAULT_MODEL = "jina-embeddings-v3"
     URL = "https://api.jina.ai/v1/embeddings"
 
@@ -174,6 +178,7 @@ class HuggingFaceEmbedder(Embedder):
     multilingual-e5-small (English, Hindi, German) — still no local download.
     """
 
+    name = "hf"
     DEFAULT_MODEL = "intfloat/multilingual-e5-small"
     ROUTER = "https://router.huggingface.co/hf-inference/models"
 

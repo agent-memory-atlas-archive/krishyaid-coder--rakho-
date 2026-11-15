@@ -4,16 +4,18 @@ from pathlib import Path
 from typing import Any
 
 from rakho.embeddings import Embedder, resolve_embedder
-from rakho.gate import AllowAllGate, DefaultPolicyGate, PolicyGate, mask_preview
+from rakho.gate import AllowAllGate, DefaultPolicyGate, PolicyGate, is_injection, mask_preview
 from rakho.languages import ACTIONS, BUILT_IN, invert, normalize_pack
 from rakho.models import (
     AuditReport,
+    Decision,
     ForgetResult,
     KeepResult,
     Memory,
+    Mutation,
     Refusal,
 )
-from rakho.storage import SQLiteEngine, StorageEngine
+from rakho.storage import SQLiteEngine, StorageEngine, value_fingerprint
 
 
 def estimate_tokens(text: str) -> int:
@@ -82,8 +84,17 @@ class Rakho:
             "source": source,
             "session_id": session_id,
             "origin_tool": origin_tool,
+            "metadata": metadata or {},
         }
         decision = self.gate.inspect(content, context)
+        fp = value_fingerprint(content)
+        if self.storage.has_tombstone(actor_id=actor_id, fingerprint=fp):
+            decision = Decision(
+                action="skip",
+                content="",
+                reason="tombstone",
+                labels=list(decision.labels) or ["tombstone"],
+            )
 
         if decision.action == "skip":
             refusal = Refusal(
@@ -94,6 +105,21 @@ class Rakho:
                 preview=mask_preview(content, decision),
             )
             self.storage.put_refusal(refusal)
+            self.storage.put_tombstone(
+                actor_id=actor_id,
+                fingerprint=fp,
+                reason=decision.reason,
+                labels=list(decision.labels),
+            )
+            self.storage.put_mutation(
+                Mutation(
+                    op="skip",
+                    actor_id=actor_id,
+                    scope=scope,
+                    target_id=refusal.id,
+                    detail={"reason": decision.reason, "labels": list(decision.labels)},
+                )
+            )
             return KeepResult(action="skip", refused=refusal)
 
         memory = Memory(
@@ -106,8 +132,18 @@ class Rakho:
             sensitivity=decision.sensitivity,
             metadata=metadata or {},
             embedding=self.embedder.embed(decision.content, role="document"),
+            embedder=getattr(self.embedder, "name", None),
         )
         self.storage.put(memory)
+        self.storage.put_mutation(
+            Mutation(
+                op="redact" if decision.action == "redact" else "keep",
+                actor_id=actor_id,
+                scope=scope,
+                target_id=memory.id,
+                detail={"labels": list(decision.labels), "embedder": memory.embedder},
+            )
+        )
         return KeepResult(action=decision.action, stored=memory)
 
     def recall(
@@ -120,6 +156,8 @@ class Rakho:
         budget: int = 512,
     ) -> list[Memory]:
         actor_id = _require_actor(actor_id)
+        if is_injection(query):
+            return []
         query_vec = self.embedder.embed(query, role="query") if query.strip() else None
         hits = self.storage.search(
             query,
@@ -127,6 +165,8 @@ class Rakho:
             actor_id=actor_id,
             scope=scope,
             k=max(k, 1),
+            query_embedder=getattr(self.embedder, "name", None),
+            query_dim=len(query_vec) if query_vec is not None else None,
         )
         packed = pack_to_budget(hits, budget)
         if packed:
@@ -145,15 +185,40 @@ class Rakho:
             raise ValueError(
                 "forget() needs actor_id, session_id, or id — refusing to wipe the whole store"
             )
-        memories_deleted, refusals_deleted = self.storage.delete(
+        memories_deleted, refusals_deleted, orphaned = self.storage.delete(
             actor_id=actor_id,
             scope=scope,
             session_id=session_id,
             id=id,
         )
+        log_actor = actor_id or "unknown"
+        if orphaned:
+            for target in orphaned:
+                self.storage.put_mutation(
+                    Mutation(
+                        op="orphan",
+                        actor_id=log_actor,
+                        scope=scope,
+                        target_id=target,
+                        detail={"reason": "source_forgotten"},
+                    )
+                )
+        self.storage.put_mutation(
+            Mutation(
+                op="forget",
+                actor_id=log_actor,
+                scope=scope,
+                detail={
+                    "memories_deleted": memories_deleted,
+                    "memories_orphaned": len(orphaned),
+                    "filter": {"actor_id": actor_id, "session_id": session_id, "id": id},
+                },
+            )
+        )
         return ForgetResult(
             memories_deleted=memories_deleted,
             refusals_deleted=refusals_deleted,
+            memories_orphaned=len(orphaned),
         )
 
     def audit(self, *, actor_id: str, scope: str | None = None) -> AuditReport:
@@ -163,6 +228,7 @@ class Rakho:
             scope=scope,
             memories=self.storage.list_memories(actor_id=actor_id, scope=scope),
             refusals=self.storage.list_refusals(actor_id=actor_id, scope=scope),
+            mutations=self.storage.list_mutations(actor_id=actor_id, scope=scope),
         )
 
     def learn(self, language: str, verbs: dict[str, str | list[str]]) -> dict[str, str]:

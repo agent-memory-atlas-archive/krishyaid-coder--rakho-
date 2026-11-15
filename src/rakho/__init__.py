@@ -8,7 +8,7 @@ from rakho.embeddings import (
     auto_embedder,
 )
 from rakho.gate import AllowAllGate, DefaultPolicyGate, PolicyGate
-from rakho.models import AuditReport, Decision, ForgetResult, KeepResult, Memory, Refusal
+from rakho.models import AuditReport, Decision, ForgetResult, KeepResult, Memory, Mutation, Refusal
 from rakho.store import Rakho
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "JinaEmbedder",
     "KeepResult",
     "Memory",
+    "Mutation",
     "PolicyGate",
     "Rakho",
     "Refusal",

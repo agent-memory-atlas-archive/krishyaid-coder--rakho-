@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -10,7 +11,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from rakho.embeddings import cosine
-from rakho.models import Memory, Refusal, utcnow
+from rakho.models import Memory, Mutation, Refusal, utcnow
+
+SCORE_FLOOR = 0.05
 
 
 SCHEMA = """
@@ -27,7 +30,10 @@ CREATE TABLE IF NOT EXISTS memories (
     last_used_at TEXT NOT NULL,
     sensitivity TEXT NOT NULL,
     scope TEXT NOT NULL,
-    metadata TEXT NOT NULL DEFAULT '{}'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    embedder TEXT,
+    embedding_dim INTEGER,
+    trust TEXT NOT NULL DEFAULT 'trusted'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_actor_scope ON memories(actor_id, scope);
@@ -59,7 +65,32 @@ CREATE TABLE IF NOT EXISTS verb_packs (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_verb_unique ON verb_packs(verb);
+
+CREATE TABLE IF NOT EXISTS mutations (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    op TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    scope TEXT,
+    target_id TEXT,
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_mutations_actor ON mutations(actor_id, created_at);
+
+CREATE TABLE IF NOT EXISTS tombstones (
+    actor_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    labels TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (actor_id, fingerprint)
+);
 """
+
+
+def value_fingerprint(text: str) -> str:
+    norm = " ".join(text.split()).casefold().encode("utf-8")
+    return hashlib.blake2b(norm, digest_size=16).hexdigest()
 
 
 def _parse_ts(value: str) -> datetime:
@@ -84,6 +115,8 @@ class StorageEngine(ABC):
         actor_id: str,
         scope: str,
         k: int,
+        query_embedder: str | None = None,
+        query_dim: int | None = None,
     ) -> list[Memory]:
         raise NotImplementedError
 
@@ -103,7 +136,21 @@ class StorageEngine(ABC):
         scope: str | None = None,
         session_id: str | None = None,
         id: str | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[str]]:
+        raise NotImplementedError
+
+    def put_mutation(self, mutation: Mutation) -> None:
+        raise NotImplementedError
+
+    def list_mutations(self, *, actor_id: str, scope: str | None = None) -> list[Mutation]:
+        raise NotImplementedError
+
+    def put_tombstone(
+        self, *, actor_id: str, fingerprint: str, reason: str, labels: list[str]
+    ) -> None:
+        raise NotImplementedError
+
+    def has_tombstone(self, *, actor_id: str, fingerprint: str) -> bool:
         raise NotImplementedError
 
     @abstractmethod
@@ -128,7 +175,19 @@ class SQLiteEngine(StorageEngine):
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)")}
+        if "embedder" not in cols:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN embedder TEXT")
+        if "embedding_dim" not in cols:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN embedding_dim INTEGER")
+        if "trust" not in cols:
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN trust TEXT NOT NULL DEFAULT 'trusted'"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -141,8 +200,9 @@ class SQLiteEngine(StorageEngine):
             """
             INSERT INTO memories (
                 id, content, embedding, kind, source, session_id, actor_id,
-                origin_tool, created_at, last_used_at, sensitivity, scope, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                origin_tool, created_at, last_used_at, sensitivity, scope, metadata,
+                embedder, embedding_dim, trust
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -158,6 +218,9 @@ class SQLiteEngine(StorageEngine):
                 memory.sensitivity,
                 memory.scope,
                 json.dumps(memory.metadata),
+                memory.embedder,
+                len(memory.embedding) if memory.embedding is not None else None,
+                memory.trust,
             ),
         )
         self._conn.execute(
@@ -204,6 +267,8 @@ class SQLiteEngine(StorageEngine):
             sensitivity=row["sensitivity"],
             scope=row["scope"],
             metadata=json.loads(row["metadata"] or "{}"),
+            embedder=row["embedder"] if "embedder" in row.keys() else None,
+            trust=row["trust"] if "trust" in row.keys() and row["trust"] else "trusted",
         )
 
     def search(
@@ -214,9 +279,15 @@ class SQLiteEngine(StorageEngine):
         actor_id: str,
         scope: str,
         k: int,
+        query_embedder: str | None = None,
+        query_dim: int | None = None,
     ) -> list[Memory]:
         rows = self._conn.execute(
-            "SELECT * FROM memories WHERE actor_id = ? AND scope = ?",
+            """
+            SELECT * FROM memories
+            WHERE actor_id = ? AND scope = ?
+              AND IFNULL(trust, 'trusted') != 'orphaned'
+            """,
             (actor_id, scope),
         ).fetchall()
         if not rows:
@@ -239,10 +310,10 @@ class SQLiteEngine(StorageEngine):
                     (match_query, actor_id, scope),
                 ).fetchall()
                 if fts_rows:
-                    worst = max(abs(r["rank"]) for r in fts_rows) or 1.0
+                    best = max(abs(r["rank"]) for r in fts_rows) or 1.0
                     for r in fts_rows:
                         # bm25: more negative is better in sqlite fts5
-                        fts_scores[r["id"]] = 1.0 - (abs(r["rank"]) / (worst + 1e-9))
+                        fts_scores[r["id"]] = abs(r["rank"]) / (best + 1e-9)
             except sqlite3.OperationalError:
                 like = f"%{query}%"
                 for r in self._conn.execute(
@@ -260,12 +331,20 @@ class SQLiteEngine(StorageEngine):
             mem = self._row_to_memory(row)
             vec_score = 0.0
             if query_vec is not None and mem.embedding is not None:
-                vec_score = max(0.0, cosine(query_vec, mem.embedding))
+                dim_ok = query_dim is None or len(mem.embedding) == query_dim
+                embedder_ok = (
+                    not query_embedder
+                    or not mem.embedder
+                    or mem.embedder == query_embedder
+                )
+                if dim_ok and embedder_ok:
+                    vec_score = max(0.0, cosine(query_vec, mem.embedding))
             fts_score = fts_scores.get(mem.id, 0.0)
+            if vec_score < SCORE_FLOOR and fts_score < SCORE_FLOOR:
+                continue
             age_hours = max(0.0, (now - mem.created_at).total_seconds() / 3600.0)
             recency = 1.0 / (1.0 + age_hours / 24.0)
             mem.score = 0.5 * vec_score + 0.3 * fts_score + 0.2 * recency
-            # keyword miss still can rank via vector/recency; keep all, sort, cut
             scored.append(mem)
 
         scored.sort(key=lambda m: m.score, reverse=True)
@@ -315,7 +394,7 @@ class SQLiteEngine(StorageEngine):
         scope: str | None = None,
         session_id: str | None = None,
         id: str | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[str]]:
         where: list[str] = []
         params: list[Any] = []
         if id:
@@ -349,25 +428,94 @@ class SQLiteEngine(StorageEngine):
         cur = self._conn.execute(f"DELETE FROM memories WHERE {clause}", params)
         memories_deleted = cur.rowcount if cur.rowcount != -1 else len(ids)
 
-        ref_where: list[str] = []
-        ref_params: list[Any] = []
-        if actor_id:
-            ref_where.append("actor_id = ?")
-            ref_params.append(actor_id)
-        if scope:
-            ref_where.append("scope = ?")
-            ref_params.append(scope)
-        # session_id / memory id do not apply to refusals
+        # Refusals stay: they are the proof that something was skipped, never the secret.
         refusals_deleted = 0
-        if ref_where and not id and not session_id:
-            ref_clause = " AND ".join(ref_where)
-            cur = self._conn.execute(f"DELETE FROM refusals WHERE {ref_clause}", ref_params)
-            refusals_deleted = cur.rowcount if cur.rowcount != -1 else 0
-        elif id:
-            pass
-
+        orphaned = self._orphan_derived(ids)
         self._conn.commit()
-        return memories_deleted, refusals_deleted
+        return memories_deleted, refusals_deleted, orphaned
+
+    def _orphan_derived(self, deleted_ids: list[str]) -> list[str]:
+        if not deleted_ids:
+            return []
+        gone = set(deleted_ids)
+        orphaned: list[str] = []
+        rows = self._conn.execute("SELECT id, metadata FROM memories").fetchall()
+        for row in rows:
+            meta = json.loads(row["metadata"] or "{}")
+            derived = meta.get("derived_from") or meta.get("source_ids") or []
+            if isinstance(derived, str):
+                derived = [derived]
+            if not isinstance(derived, list):
+                continue
+            if any(item in gone for item in derived):
+                self._conn.execute(
+                    "UPDATE memories SET trust = 'orphaned' WHERE id = ?",
+                    (row["id"],),
+                )
+                orphaned.append(row["id"])
+        return orphaned
+
+    def put_mutation(self, mutation: Mutation) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO mutations (id, created_at, op, actor_id, scope, target_id, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mutation.id,
+                mutation.created_at.isoformat(),
+                mutation.op,
+                mutation.actor_id,
+                mutation.scope,
+                mutation.target_id,
+                json.dumps(mutation.detail),
+            ),
+        )
+        self._conn.commit()
+
+    def list_mutations(self, *, actor_id: str, scope: str | None = None) -> list[Mutation]:
+        if scope is None:
+            rows = self._conn.execute(
+                "SELECT * FROM mutations WHERE actor_id = ? ORDER BY created_at DESC",
+                (actor_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM mutations WHERE actor_id = ? AND IFNULL(scope, ?) = ? "
+                "ORDER BY created_at DESC",
+                (actor_id, scope, scope),
+            ).fetchall()
+        return [
+            Mutation(
+                id=r["id"],
+                op=r["op"],
+                actor_id=r["actor_id"],
+                scope=r["scope"],
+                target_id=r["target_id"],
+                detail=json.loads(r["detail"] or "{}"),
+                created_at=_parse_ts(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    def put_tombstone(
+        self, *, actor_id: str, fingerprint: str, reason: str, labels: list[str]
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO tombstones (actor_id, fingerprint, reason, labels, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (actor_id, fingerprint, reason, json.dumps(labels), utcnow().isoformat()),
+        )
+        self._conn.commit()
+
+    def has_tombstone(self, *, actor_id: str, fingerprint: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM tombstones WHERE actor_id = ? AND fingerprint = ?",
+            (actor_id, fingerprint),
+        ).fetchone()
+        return row is not None
 
     def touch(self, ids: Iterable[str]) -> None:
         now = utcnow().isoformat()
