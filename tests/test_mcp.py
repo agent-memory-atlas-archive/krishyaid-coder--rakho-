@@ -36,7 +36,8 @@ def test_mcp_tools_keep_recall_forget_audit(tools):
     assert forgotten["memories_deleted"] >= 1
     empty = json.loads(tools["audit"]("krishy"))
     assert empty["stored_count"] == 0
-    assert empty["refused_count"] == 0
+    assert empty["refused_count"] >= 1
+    assert empty["mutation_count"] >= 1
 
 
 def test_mcp_tool_names(tmp_path):

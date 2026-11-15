@@ -44,11 +44,14 @@ def test_krishy_story(db: Rakho):
 
     forgotten = db.forget(actor_id="krishy")
     assert forgotten.memories_deleted >= 1
-    assert forgotten.refusals_deleted >= 1
+    assert forgotten.refusals_deleted == 0
 
     empty = db.audit(actor_id="krishy")
     assert empty.memories == []
-    assert empty.refusals == []
+    assert empty.refusals  # proof of the skip, never the secret
+    assert all("sk-" not in r.preview for r in empty.refusals)
+    assert any(m.op == "forget" for m in empty.mutations)
+    assert db.recall("order", actor_id="krishy") == []
 
     priya = db.audit(actor_id="priya")
     assert len(priya.memories) == 1
@@ -158,4 +161,6 @@ def test_cli_roundtrip(tmp_path, capsys):
     assert main(["--db", db_path, "dekho", "--actor", "krishy", "--json"]) == 0
     empty = json.loads(capsys.readouterr().out)
     assert empty["stored_count"] == 0
-    assert empty["refused_count"] == 0
+    assert empty["refused_count"] >= 1
+    assert empty["mutation_count"] >= 1
+    assert any(m["op"] == "forget" for m in empty["mutations"])

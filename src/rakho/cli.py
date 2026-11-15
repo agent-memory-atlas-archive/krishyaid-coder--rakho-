@@ -145,12 +145,20 @@ def _dispatch(db: Rakho, args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(report.to_public_dict(), indent=2, ensure_ascii=False))
             return 0
-        print(f"stored {len(report.memories)}  refused {len(report.refusals)}")
+        print(
+            f"stored {len(report.memories)}  refused {len(report.refusals)}  "
+            f"mutations {len(report.mutations)}"
+        )
         for mem in report.memories:
             dim = len(mem.embedding) if mem.embedding else 0
-            print(f"  keep  {mem.sensitivity:8}  {dim:>4}d  {mem.content}")
+            print(
+                f"  keep  {mem.trust:8}  {mem.sensitivity:8}  {dim:>4}d  "
+                f"{mem.embedder or '-':5}  {mem.content}"
+            )
         for ref in report.refusals:
             print(f"  skip  {ref.reason:8}  {ref.preview}")
+        for mut in report.mutations:
+            print(f"  log   {mut.op:8}  {mut.detail}")
         return 0
 
     print(f"error: unhandled action {action}", file=sys.stderr)

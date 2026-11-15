@@ -96,8 +96,8 @@ v1 storage: SQLite + FTS5. Vectors as blobs; cosine in process. Swap the engine 
 
 1. Krishy: "my order is late. password is hunter2" → keep the order, refuse the password.
 2. Recall "order" for Krishy → late order, no password.
-3. Priya has her own note. Forget Krishy → his rows are gone, including refusals. Priya untouched.
-4. `audit(actor_id="krishy")` is empty.
+3. Priya has her own note. Forget Krishy → his notes are gone (row + FTS + vector). Refusals and a forget event stay, so `dekho` can prove it. Priya untouched.
+4. `recall` for Krishy is empty. `dekho` shows the skip + the forget event, not the secret.
 
 Ship when that is boringly reliable.
 

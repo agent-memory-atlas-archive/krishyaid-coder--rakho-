@@ -9,6 +9,8 @@ from uuid import uuid4
 Action = Literal["store", "redact", "skip"]
 Sensitivity = Literal["clean", "redacted"]
 Kind = Literal["episode"]
+Trust = Literal["trusted", "orphaned"]
+MutationOp = Literal["keep", "redact", "skip", "forget", "orphan"]
 
 
 def utcnow() -> datetime:
@@ -47,6 +49,8 @@ class Memory:
     scope: str = "default"
     metadata: dict[str, Any] = field(default_factory=dict)
     score: float = 0.0
+    embedder: str | None = None
+    trust: Trust = "trusted"
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +68,8 @@ class Memory:
             "metadata": self.metadata,
             "score": self.score,
             "embedding_dim": len(self.embedding) if self.embedding else 0,
+            "embedder": self.embedder,
+            "trust": self.trust,
         }
 
 
@@ -90,6 +96,28 @@ class Refusal:
 
 
 @dataclass
+class Mutation:
+    op: MutationOp
+    actor_id: str
+    id: str = field(default_factory=new_id)
+    scope: str | None = None
+    target_id: str | None = None
+    detail: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "op": self.op,
+            "actor_id": self.actor_id,
+            "scope": self.scope,
+            "target_id": self.target_id,
+            "detail": self.detail,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+@dataclass
 class KeepResult:
     action: Action
     stored: Memory | None = None
@@ -103,7 +131,8 @@ class KeepResult:
 @dataclass
 class ForgetResult:
     memories_deleted: int
-    refusals_deleted: int
+    refusals_deleted: int = 0
+    memories_orphaned: int = 0
 
     @property
     def deleted(self) -> int:
@@ -116,6 +145,7 @@ class AuditReport:
     refusals: list[Refusal]
     actor_id: str
     scope: str | None = None
+    mutations: list[Mutation] = field(default_factory=list)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +153,8 @@ class AuditReport:
             "scope": self.scope,
             "stored": [m.to_public_dict() for m in self.memories],
             "refused": [r.to_public_dict() for r in self.refusals],
+            "mutations": [m.to_public_dict() for m in self.mutations],
             "stored_count": len(self.memories),
             "refused_count": len(self.refusals),
+            "mutation_count": len(self.mutations),
         }
